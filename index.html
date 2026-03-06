@@ -1,565 +1,593 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { getFirestore, collection, onSnapshot, doc, setDoc, updateDoc, addDoc, deleteDoc } from 'firebase/firestore';
-import { 
-  MapPin, Clock, Users, AlertCircle, CheckCircle, Plus, 
-  HeartHandshake, TrendingUp, X, Phone, Lock, Unlock, 
-  Settings, Award, BarChart3, ChevronRight, Download,
-  Trophy, User, Info, Map as MapIcon, Star
-} from 'lucide-react';
-
-// --- Firebase Initialization ---
-const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'mivtzaim-app-nayadot-v4';
-
-export default function App() {
-  const [user, setUser] = useState(null);
-  const [stands, setStands] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [isAdmin, setIsAdmin] = useState(false);
-  
-  // Modals state
-  const [showAddStand, setShowAddStand] = useState(false);
-  const [showAssignModal, setShowAssignModal] = useState(false);
-  const [showReportModal, setShowReportModal] = useState(false);
-  const [showAdminModal, setShowAdminModal] = useState(false);
-  const [showSuccessMsg, setShowSuccessMsg] = useState(false);
-  
-  const [selectedStand, setSelectedStand] = useState(null);
-  const [selectedSlot, setSelectedSlot] = useState(null);
-  
-  // Forms state
-  const [newStandLocation, setNewStandLocation] = useState('');
-  const [newStandType, setNewStandType] = useState('תפילין');
-  const [customStandType, setCustomStandType] = useState('');
-  const [newStandStartTime, setNewStandStartTime] = useState('10:00');
-  const [newStandEndTime, setNewStandEndTime] = useState('14:00');
-  const [reportCategories, setReportCategories] = useState(['הנחות', 'חומר הסברה']);
-  const [adminPassword, setAdminPassword] = useState('');
-  
-  // Assign/Report Forms
-  const [userNameInput, setUserNameInput] = useState('');
-  const [userPhoneInput, setUserPhoneInput] = useState('');
-  const [currentReportValues, setCurrentReportValues] = useState({});
-
-  const CAMPAIGN_TARGET = 1000; // יעד הפעילות עבור מד ההתקדמות
-
-  // 1. Initialize Auth
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token);
-        } else {
-          await signInAnonymously(auth);
-        }
-      } catch (error) {}
-    };
-    initAuth();
-    const unsubscribe = onAuthStateChanged(auth, setUser);
-    return () => unsubscribe();
-  }, []);
-
-  // 2. Fetch Data
-  useEffect(() => {
-    if (!user) return;
-    const standsRef = collection(db, 'artifacts', appId, 'public', 'data', 'stands');
-    const unsubscribe = onSnapshot(standsRef, (snapshot) => {
-      const standsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      setStands(standsData.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')));
-      setLoading(false);
-    }, () => setLoading(false));
-    return () => unsubscribe();
-  }, [user]);
-
-  // --- Logic & Calculations ---
-  const stats = useMemo(() => {
-    let totalReached = 0;
-    let activeStandsCount = 0;
-    let topStand = { location: '-', count: 0 };
-    const volunteersMap = {};
-    const categoryTotals = {};
-
-    stands.forEach(stand => {
-      const standTotal = Object.values(stand.reports || {}).reduce((a, b) => a + (Number(b) || 0), 0);
-      totalReached += standTotal;
-      
-      // Calculate totals per category
-      Object.entries(stand.reports || {}).forEach(([cat, val]) => {
-        categoryTotals[cat] = (categoryTotals[cat] || 0) + Number(val);
-      });
-      
-      const slots = stand.slots || [];
-      const hasVolunteers = slots.some(s => s.volunteer);
-      if (hasVolunteers) activeStandsCount++;
-      
-      if (standTotal > topStand.count) topStand = { location: stand.location, count: standTotal };
-
-      slots.forEach(slot => {
-        if (slot.volunteer && slot.reportedValues) {
-          const vId = slot.volunteer.userId;
-          const vName = slot.volunteer.name;
-          const vSum = Object.values(slot.reportedValues).reduce((a,b) => a + (Number(b) || 0), 0);
-          if (!volunteersMap[vId]) volunteersMap[vId] = { name: vName, total: 0 };
-          volunteersMap[vId].total += vSum;
-        }
-      });
-    });
-
-    const topVolunteer = Object.values(volunteersMap).sort((a,b) => b.total - a.total)[0] || { name: '-', total: 0 };
-
-    return { totalReached, activeStandsCount, topStand, topVolunteer, categoryTotals };
-  }, [stands]);
-
-  const handleAdminLogin = (e) => {
-    e.preventDefault();
-    if (adminPassword === '770') {
-      setIsAdmin(true);
-      setShowAdminModal(false);
-      setAdminPassword('');
-    }
-  };
-
-  const handleAddStand = async (e) => {
-    e.preventDefault();
-    if (!isAdmin) return;
-    const slots = [];
-    let cur = new Date(`2000-01-01T${newStandStartTime}`);
-    const end = new Date(`2000-01-01T${newStandEndTime}`);
-    while (cur < end) {
-      const s = cur.toLocaleTimeString('he-IL', {hour:'2-digit', minute:'2-digit'});
-      cur.setHours(cur.getHours() + 1);
-      const e = cur.toLocaleTimeString('he-IL', {hour:'2-digit', minute:'2-digit'});
-      slots.push({ id: crypto.randomUUID(), startTime: s, endTime: e, volunteer: null });
-    }
-
-    const finalType = newStandType === 'אחר' ? customStandType : newStandType;
-
-    await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'stands'), {
-      location: newStandLocation,
-      type: finalType,
-      slots,
-      reports: {},
-      categories: reportCategories,
-      createdAt: new Date().toISOString()
-    });
-    setShowAddStand(false);
-    setNewStandLocation('');
-    setCustomStandType('');
-  };
-
-  const handleAssign = async (e) => {
-    e.preventDefault();
-    const standRef = doc(db, 'artifacts', appId, 'public', 'data', 'stands', selectedStand.id);
-    const updatedSlots = selectedStand.slots.map(s => s.id === selectedSlot.id ? {
-      ...s, volunteer: { userId: user.uid, name: userNameInput, phone: userPhoneInput }
-    } : s);
-    await updateDoc(standRef, { slots: updatedSlots });
-    setShowAssignModal(false);
-  };
-
-  const handleReport = async (e) => {
-    e.preventDefault();
-    const standRef = doc(db, 'artifacts', appId, 'public', 'data', 'stands', selectedStand.id);
-    const newReports = { ...(selectedStand.reports || {}) };
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>מרכז המבצעים - ניידות חב"ד</title>
     
-    // Add to total stand reports
-    Object.keys(currentReportValues).forEach(cat => {
-      newReports[cat] = (newReports[cat] || 0) + Number(currentReportValues[cat]);
-    });
-
-    // Add specifically to the selected slot and user
-    const updatedSlots = selectedStand.slots.map(s => {
-      if (s.id === selectedSlot.id && s.volunteer?.userId === user.uid) {
-        const existing = s.reportedValues || {};
-        const updated = { ...existing };
-        Object.keys(currentReportValues).forEach(cat => {
-          updated[cat] = (updated[cat] || 0) + Number(currentReportValues[cat]);
-        });
-        return { ...s, reportedValues: updated };
-      }
-      return s;
-    });
-
-    await updateDoc(standRef, { reports: newReports, slots: updatedSlots });
-    setShowReportModal(false);
-    setShowSuccessMsg(true); // Show the success message modal
-  };
-
-  const exportToExcel = () => {
-    let csv = "\uFEFFמיקום,סוג,קטגוריה,כמות\n";
-    stands.forEach(stand => {
-      Object.entries(stand.reports || {}).forEach(([cat, val]) => {
-        csv += `${stand.location},${stand.type},${cat},${val}\n`;
-      });
-    });
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
     
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.setAttribute("href", url);
-    link.setAttribute("download", `דוח_מבצעים_${new Date().toLocaleDateString()}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-  };
+    <!-- FontAwesome Icons -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    
+    <!-- Babel for JSX compilation in the browser -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  if (loading) return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-[#002B5B] text-white" dir="rtl">
-      <HeartHandshake className="animate-pulse text-[#FFD700] w-20 h-20 mb-4" />
-      <h2 className="text-xl font-bold">טוען נתונים...</h2>
-    </div>
-  );
+    <!-- Firebase SDKs (Modular) -->
+    <script type="module">
+        import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js';
+        import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js';
+        import { getFirestore, collection, onSnapshot, doc, setDoc, updateDoc, addDoc, deleteDoc } from 'https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js';
 
-  return (
-    <div className="min-h-screen bg-[#F4F4F4] font-sans text-slate-900 pb-20" dir="rtl">
-      
-      {/* Top Stats Bar - Nayadot Branding */}
-      <div className="bg-[#002B5B] text-white p-3 sticky top-0 z-40 shadow-xl border-b-4 border-[#FFD700]">
-        <div className="max-w-5xl mx-auto flex items-center justify-between overflow-x-auto gap-8 no-scrollbar px-2">
-          
-          <div className="flex items-center gap-3 whitespace-nowrap bg-blue-900/40 p-2 px-4 rounded-xl border border-blue-700">
-            <Trophy className="w-5 h-5 text-[#FFD700]" />
-            <div className="text-sm font-black text-white leading-tight tracking-wide">
-              {stats.topVolunteer.name} <span className="text-[#FFD700] mr-1 text-xs">({stats.topVolunteer.total})</span>
-            </div>
-          </div>
+        // Expose Firebase to the global window object
+        window.firebaseModules = {
+            initializeApp, getAuth, signInAnonymously, onAuthStateChanged,
+            getFirestore, collection, onSnapshot, doc, setDoc, updateDoc, addDoc, deleteDoc
+        };
+        window.dispatchEvent(new Event('firebase-modules-loaded'));
+    </script>
+</head>
+<body class="bg-[#F4F4F4] font-sans text-slate-900 pb-20">
+    <div id="root"></div>
 
-          <div className="flex items-center gap-3 whitespace-nowrap bg-blue-900/40 p-2 px-4 rounded-xl border border-blue-700">
-            <MapIcon className="w-4 h-4 text-[#FFD700]" />
-            <div>
-              <div className="text-[10px] text-blue-200">דוכן מוביל</div>
-              <div className="text-sm font-bold text-white leading-tight">
-                {stats.topStand.location} <span className="text-[#FFD700]">({stats.topStand.count})</span>
-              </div>
-            </div>
-          </div>
+    <script type="text/babel" data-type="module">
+        const { useState, useEffect, useMemo } = React;
 
-          <div className="mr-auto flex items-center gap-4">
-             {isAdmin && (
-               <button onClick={exportToExcel} className="p-2 bg-emerald-600 hover:bg-emerald-700 rounded-lg text-white transition-all shadow-md active:scale-90" title="ייצוא לאקסל">
-                 <Download className="w-4 h-4" />
-               </button>
-             )}
-             <button onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminModal(true)} className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors">
-               {isAdmin ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
-             </button>
-          </div>
-        </div>
-      </div>
+        // --- Icons ---
+        const MapPin = ({className}) => <i className={`fas fa-map-marker-alt ${className || ''}`}></i>;
+        const Clock = ({className}) => <i className={`fas fa-clock ${className || ''}`}></i>;
+        const CheckCircle = ({className}) => <i className={`fas fa-check-circle ${className || ''}`}></i>;
+        const Plus = ({className}) => <i className={`fas fa-plus ${className || ''}`}></i>;
+        const HeartHandshake = ({className}) => <i className={`fas fa-handshake ${className || ''}`}></i>;
+        const TrendingUp = ({className}) => <i className={`fas fa-chart-line ${className || ''}`}></i>;
+        const Phone = ({className}) => <i className={`fas fa-phone ${className || ''}`}></i>;
+        const Lock = ({className}) => <i className={`fas fa-lock ${className || ''}`}></i>;
+        const Unlock = ({className}) => <i className={`fas fa-unlock ${className || ''}`}></i>;
+        const Download = ({className}) => <i className={`fas fa-download ${className || ''}`}></i>;
+        const Trophy = ({className}) => <i className={`fas fa-trophy ${className || ''}`}></i>;
+        const MapIcon = ({className}) => <i className={`fas fa-map ${className || ''}`}></i>;
+        const Star = ({className}) => <i className={`fas fa-star ${className || ''}`}></i>;
+        const ChevronRight = ({className}) => <i className={`fas fa-chevron-right ${className || ''}`}></i>;
 
-      <header className="bg-[#002B5B] relative overflow-hidden text-white pt-12 pb-20 px-6 text-center">
-        <div className="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
-           <div className="absolute top-10 left-10 w-40 h-40 border-4 border-white rotate-12"></div>
-           <div className="absolute bottom-10 right-10 w-60 h-60 border-[12px] border-[#FFD700] rounded-full"></div>
-        </div>
-        
-        <div className="relative z-10 flex flex-col items-center">
-          <img src="https://nayadotchabad.co.il/wp-content/uploads/2021/05/logo.png" alt="ניידות חב" className="h-16 mb-4 filter brightness-0 invert" 
-               onError={(e) => { e.target.style.display = 'none'; }} />
-          <h1 className="text-4xl font-black mb-2 tracking-tighter">מרכז המבצעים</h1>
-          <p className="bg-[#FFD700] text-[#002B5B] px-4 py-1 rounded-full text-sm font-black uppercase tracking-widest inline-block">
-            מביאים את האור לכל מקום
-          </p>
-        </div>
-      </header>
+        function App({ firebaseModules }) {
+            const { 
+                initializeApp, getAuth, signInAnonymously, onAuthStateChanged,
+                getFirestore, collection, onSnapshot, doc, updateDoc, addDoc, deleteDoc
+            } = firebaseModules;
 
-      <main className="max-w-4xl mx-auto px-4 -mt-12 space-y-6 relative z-20">
-        
-        {/* Progress Card & Stats Summary */}
-        <div className="bg-white rounded-[2.5rem] shadow-2xl p-8 border-b-8 border-[#FFD700] flex flex-col gap-6">
-           <div className="flex flex-col md:flex-row justify-between items-center gap-4">
-              <div className="flex items-center gap-3">
-                 <div className="p-3 bg-blue-50 rounded-2xl text-blue-900"><TrendingUp className="w-6 h-6" /></div>
-                 <h2 className="text-2xl font-black text-[#002B5B]">יעד המבצעים</h2>
-              </div>
-              <div className="text-center md:text-right">
-                <span className="block text-xs font-black text-slate-400 uppercase">הגענו ל-</span>
-                <span className="text-5xl font-black text-[#002B5B]">{stats.totalReached}</span>
-              </div>
-           </div>
-           
-           {/* PROGRESS BAR */}
-           <div className="w-full mt-2 mb-2">
-             <div className="flex justify-between text-xs font-black text-slate-400 mb-2 px-2">
-               <span>0</span>
-               <span>יעד: {CAMPAIGN_TARGET.toLocaleString()}</span>
-             </div>
-             <div className="h-8 bg-slate-100 rounded-full overflow-hidden shadow-inner relative">
-                <div className="h-full bg-gradient-to-r from-blue-500 to-[#002B5B] transition-all duration-1000 relative flex items-center justify-end px-4" 
-                     style={{ width: `${Math.min((stats.totalReached / CAMPAIGN_TARGET) * 100, 100)}%` }}>
-                  {/* Optional shimmering effect class can go here */}
-                </div>
-             </div>
-           </div>
-
-           {/* Detail Stats Section */}
-           <div className="flex flex-wrap gap-3 justify-center bg-slate-50 p-4 rounded-3xl border border-slate-100">
-              <div className="bg-white px-5 py-2.5 rounded-2xl shadow-sm border border-slate-100 flex items-center gap-2">
-                <MapPin className="w-4 h-4 text-[#002B5B]" />
-                <span className="text-sm font-bold text-slate-600">מוקדים פעילים:</span>
-                <span className="text-base font-black text-[#002B5B]">{stats.activeStandsCount}</span>
-              </div>
-              
-              {Object.entries(stats.categoryTotals).map(([cat, val]) => (
-                <div key={cat} className="bg-white px-5 py-2.5 rounded-2xl shadow-sm border border-slate-100 flex items-center gap-2">
-                  <Star className="w-4 h-4 text-[#FFD700]" />
-                  <span className="text-sm font-bold text-slate-600">{cat}:</span>
-                  <span className="text-base font-black text-[#002B5B]">{val}</span>
-                </div>
-              ))}
-           </div>
-        </div>
-
-        {isAdmin && (
-          <button onClick={() => setShowAddStand(true)} className="w-full bg-[#002B5B] text-white p-5 rounded-[2rem] font-black flex items-center justify-center gap-3 shadow-xl hover:scale-[1.02] transition-transform">
-            <Plus className="w-6 h-6 text-[#FFD700]" /> הוספת מוקד חדש
-          </button>
-        )}
-
-        {/* Stands Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-          {stands.map(stand => (
-            <div key={stand.id} className="bg-white rounded-[2rem] shadow-lg border-2 border-slate-100 overflow-hidden group flex flex-col">
-              <div className="p-6 flex-grow">
-                <div className="flex justify-between items-start mb-4">
-                  <div className="bg-blue-50 text-[#002B5B] px-3 py-1 rounded-full text-[10px] font-black uppercase border border-blue-100">
-                    {stand.type}
-                  </div>
-                  <MapPin className="w-5 h-5 text-[#FFD700]" />
-                </div>
-                <h3 className="text-2xl font-black text-[#002B5B] leading-tight mb-4">{stand.location}</h3>
-                
-                <div className="space-y-1 mb-6">
-                  {Object.entries(stand.reports || {}).map(([cat, val]) => (
-                    <div key={cat} className="flex justify-between items-center text-xs font-bold border-b border-slate-50 py-1">
-                      <span className="text-slate-400">{cat}:</span>
-                      <span className="text-[#002B5B] font-black">{val}</span>
-                    </div>
-                  ))}
-                </div>
-
-                <div className="space-y-3">
-                  {stand.slots.map(slot => {
-                    const isTaken = !!slot.volunteer;
-                    const isMine = isTaken && slot.volunteer.userId === user.uid;
-                    return (
-                      <div key={slot.id} className="relative flex items-center gap-2">
-                         <button 
-                          disabled={isTaken && !isMine}
-                          onClick={() => {
-                            if (!isTaken) {
-                              setSelectedStand(stand); setSelectedSlot(slot); setShowAssignModal(true);
-                            } else if (isMine) {
-                              // If it's my slot, clicking it opens the Report modal specifically for this slot
-                              setSelectedStand(stand); setSelectedSlot(slot); setCurrentReportValues({}); setShowReportModal(true);
-                            }
-                          }}
-                          className={`flex-grow p-4 rounded-2xl border-2 text-right transition-all flex items-center justify-between ${
-                            isMine ? 'bg-[#FFD700]/10 border-[#FFD700] hover:bg-[#FFD700]/20' : 
-                            isTaken ? 'bg-slate-50 border-slate-100 opacity-60' : 
-                            'bg-white border-blue-50 hover:border-[#002B5B]'
-                          }`}
-                        >
-                          <div className="flex items-center gap-3">
-                            <Clock className={`w-4 h-4 ${isTaken ? 'text-slate-300' : 'text-blue-300'}`} />
-                            <div className="text-right">
-                              <div className="text-[10px] font-black text-slate-400">{slot.startTime}-{slot.endTime}</div>
-                              <div className="text-xs font-black text-slate-800">
-                                {isTaken ? slot.volunteer.name : 'פנוי לשיבוץ'}
-                              </div>
-                              {isMine && (
-                                <div className="text-[10px] font-bold text-[#002B5B] mt-1 flex items-center gap-1">
-                                  <HeartHandshake className="w-3 h-3"/> לחץ לדיווח מהשטח
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                          {isTaken && !isMine && <CheckCircle className="w-5 h-5 text-slate-200" />}
-                          {!isTaken && <Plus className="w-5 h-5 text-[#FFD700]" />}
-                          {isMine && <ChevronRight className="w-5 h-5 text-[#002B5B]" />}
-                        </button>
-                        
-                        {isTaken && slot.volunteer.phone && (
-                          <a href={`tel:${slot.volunteer.phone}`} className="p-4 bg-blue-50 text-blue-600 rounded-2xl border border-blue-100"><Phone className="w-4 h-4"/></a>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {isAdmin && (
-                <div className="p-4 pt-0 border-t border-slate-50 text-center">
-                   <button onClick={async () => await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'stands', stand.id))} className="mt-2 text-[10px] font-black uppercase tracking-widest text-slate-300 hover:text-red-500">ביטול מוקד זה</button>
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-
-        <footer className="pt-16 pb-8 text-center">
-           <p className="text-xl font-black text-[#002B5B] tracking-tight uppercase border-t border-slate-200 pt-8">
-             יחי אדוננו מורנו ורבינו מלך המשיח לעולם ועד
-           </p>
-        </footer>
-      </main>
-
-      {/* --- MODALS --- */}
-      {(showAddStand || showAssignModal || showReportModal || showAdminModal || showSuccessMsg) && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6 overflow-hidden">
-          {/* Overlay */}
-          <div className="absolute inset-0 bg-[#002B5B]/80 backdrop-blur-sm" onClick={() => {
-             setShowAddStand(false); setShowAssignModal(false); setShowReportModal(false); setShowAdminModal(false); setShowSuccessMsg(false);
-          }}></div>
-
-          {/* Modal Container */}
-          <div className="bg-white w-full max-w-lg rounded-[2.5rem] shadow-2xl relative z-10 flex flex-col max-h-[90vh] sm:max-h-[85vh]">
+            const firebaseConfig = {
+                apiKey: "AIzaSyBOz7rmrgfznkSHDLfazW6DC45JU4aGDK4",
+                authDomain: "mivtzaim-e47cb.firebaseapp.com",
+                projectId: "mivtzaim-e47cb",
+                storageBucket: "mivtzaim-e47cb.firebasestorage.app",
+                messagingSenderId: "639270067668",
+                appId: "1:639270067668:web:635df3d6b6ae8419d8ca41",
+                measurementId: "G-T39ZV6D71B"
+            };
             
-            {/* Modal Scrollable Content WITH visible scrollbar */}
-            <div className="overflow-y-auto p-8 sm:p-10 custom-scroll">
-              
-              {/* Success Message */}
-              {showSuccessMsg && (
-                <div className="text-center py-4">
-                  <div className="w-24 h-24 bg-emerald-50 rounded-full flex items-center justify-center mx-auto mb-6 border-4 border-emerald-100">
-                    <CheckCircle className="w-12 h-12 text-emerald-500" />
-                  </div>
-                  <h2 className="text-3xl font-black text-[#002B5B] mb-4">תודה על העדכון!</h2>
-                  <p className="text-xl font-bold text-slate-600 mb-8 leading-relaxed">
-                    הנתונים יישלחו בדו"ח<br/>לרבי מלך המשיח שליט"א
-                  </p>
-                  <button onClick={() => setShowSuccessMsg(false)} className="w-full bg-[#002B5B] text-[#FFD700] p-5 rounded-3xl font-black text-xl shadow-xl active:scale-95 transition-all">
-                    המשך בעבודה
-                  </button>
-                </div>
-              )}
+            const app = useMemo(() => initializeApp(firebaseConfig), []);
+            const auth = useMemo(() => getAuth(app), [app]);
+            const db = useMemo(() => getFirestore(app), [app]);
+            const appId = 'mivtzaim-app-nayadot-v1';
 
-              {/* Add Stand */}
-              {showAddStand && (
-                <div className="space-y-6">
-                  <h2 className="text-3xl font-black text-[#002B5B]">הקמת מוקד</h2>
-                  <form onSubmit={handleAddStand} className="space-y-4">
-                    <input placeholder="מיקום המוקד" required value={newStandLocation} onChange={e=>setNewStandLocation(e.target.value)} className="w-full p-5 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] outline-none font-bold"/>
+            const [user, setUser] = useState(null);
+            const [stands, setStands] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [isAdmin, setIsAdmin] = useState(false);
+            const [authError, setAuthError] = useState(null);
+            
+            const [showAddStand, setShowAddStand] = useState(false);
+            const [showAssignModal, setShowAssignModal] = useState(false);
+            const [showReportModal, setShowReportModal] = useState(false);
+            const [showAdminModal, setShowAdminModal] = useState(false);
+            const [showSuccessMsg, setShowSuccessMsg] = useState(false);
+            
+            const [selectedStand, setSelectedStand] = useState(null);
+            const [selectedSlot, setSelectedSlot] = useState(null);
+            
+            const [newStandLocation, setNewStandLocation] = useState('');
+            const [newStandType, setNewStandType] = useState('תפילין');
+            const [customStandType, setCustomStandType] = useState('');
+            const [newStandStartTime, setNewStandStartTime] = useState('10:00');
+            const [newStandEndTime, setNewStandEndTime] = useState('14:00');
+            const [reportCategories, setReportCategories] = useState(['הנחות', 'חומר הסברה']);
+            const [adminPassword, setAdminPassword] = useState('');
+            
+            const [userNameInput, setUserNameInput] = useState('');
+            const [userPhoneInput, setUserPhoneInput] = useState('');
+            const [currentReportValues, setCurrentReportValues] = useState({});
+
+            const CAMPAIGN_TARGET = 1000;
+
+            useEffect(() => {
+                const initAuth = async () => {
+                    try {
+                        await signInAnonymously(auth);
+                        console.log("Auth successful");
+                    } catch (error) { 
+                        console.error("Auth error:", error);
+                        if (error.code === 'auth/configuration-not-found') {
+                            setAuthError("יש להפעיל 'Anonymous Sign-in' בהגדרות ה-Firebase Authentication.");
+                        } else {
+                            setAuthError(error.message);
+                        }
+                    }
+                };
+                initAuth();
+                const unsubscribe = onAuthStateChanged(auth, (u) => {
+                    setUser(u);
+                });
+                return () => unsubscribe();
+            }, [auth]);
+
+            useEffect(() => {
+                if (!user) return;
+                const standsRef = collection(db, 'artifacts', appId, 'public', 'data', 'stands');
+                const unsubscribe = onSnapshot(standsRef, (snapshot) => {
+                    const standsData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    setStands(standsData.sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || '')));
+                    setLoading(false);
+                }, (error) => {
+                    console.error("Firestore error:", error);
+                    setLoading(false);
+                });
+                return () => unsubscribe();
+            }, [user, db]);
+
+            const stats = useMemo(() => {
+                let totalReached = 0;
+                let activeStandsCount = 0;
+                let topStand = { location: '-', count: 0 };
+                const volunteersMap = {};
+                const categoryTotals = {};
+
+                stands.forEach(stand => {
+                    const standTotal = Object.values(stand.reports || {}).reduce((a, b) => a + (Number(b) || 0), 0);
+                    totalReached += standTotal;
                     
-                    <div className="grid grid-cols-3 gap-2">
-                       {['תפילין', 'נרות שבת', 'אחר'].map(t => (
-                         <button key={t} type="button" onClick={()=>setNewStandType(t)} className={`p-4 rounded-2xl text-xs font-black border-2 transition-all ${newStandType === t ? 'bg-[#002B5B] text-white border-[#002B5B]' : 'bg-white text-slate-400 border-slate-100'}`}>{t}</button>
-                       ))}
+                    Object.entries(stand.reports || {}).forEach(([cat, val]) => {
+                        categoryTotals[cat] = (categoryTotals[cat] || 0) + Number(val);
+                    });
+                    
+                    const slots = stand.slots || [];
+                    const hasVolunteers = slots.some(s => s.volunteer);
+                    if (hasVolunteers) activeStandsCount++;
+                    
+                    if (standTotal > topStand.count) topStand = { location: stand.location, count: standTotal };
+
+                    slots.forEach(slot => {
+                        if (slot.volunteer && slot.reportedValues) {
+                            const vId = slot.volunteer.userId;
+                            const vName = slot.volunteer.name;
+                            const vSum = Object.values(slot.reportedValues).reduce((a,b) => a + (Number(b) || 0), 0);
+                            if (!volunteersMap[vId]) volunteersMap[vId] = { name: vName, total: 0 };
+                            volunteersMap[vId].total += vSum;
+                        }
+                    });
+                });
+
+                const topVolunteer = Object.values(volunteersMap).sort((a,b) => b.total - a.total)[0] || { name: '-', total: 0 };
+
+                return { totalReached, activeStandsCount, topStand, topVolunteer, categoryTotals };
+            }, [stands]);
+
+            const handleAdminLogin = (e) => {
+                e.preventDefault();
+                if (adminPassword === '770') {
+                    setIsAdmin(true);
+                    setShowAdminModal(false);
+                    setAdminPassword('');
+                }
+            };
+
+            const handleAddStand = async (e) => {
+                e.preventDefault();
+                if (!isAdmin) return;
+                const slots = [];
+                let cur = new Date(`2000-01-01T${newStandStartTime}`);
+                const end = new Date(`2000-01-01T${newStandEndTime}`);
+                while (cur < end) {
+                    const s = cur.toLocaleTimeString('he-IL', {hour:'2-digit', minute:'2-digit'});
+                    cur.setHours(cur.getHours() + 1);
+                    const e = cur.toLocaleTimeString('he-IL', {hour:'2-digit', minute:'2-digit'});
+                    slots.push({ id: crypto.randomUUID(), startTime: s, endTime: e, volunteer: null });
+                }
+
+                const finalType = newStandType === 'אחר' ? customStandType : newStandType;
+
+                await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'stands'), {
+                    location: newStandLocation,
+                    type: finalType,
+                    slots,
+                    reports: {},
+                    categories: reportCategories,
+                    createdAt: new Date().toISOString()
+                });
+                setShowAddStand(false);
+                setNewStandLocation('');
+                setCustomStandType('');
+            };
+
+            const handleAssign = async (e) => {
+                e.preventDefault();
+                if (!user) return;
+                const standRef = doc(db, 'artifacts', appId, 'public', 'data', 'stands', selectedStand.id);
+                const updatedSlots = selectedStand.slots.map(s => s.id === selectedSlot.id ? {
+                    ...s, volunteer: { userId: user.uid, name: userNameInput, phone: userPhoneInput }
+                } : s);
+                await updateDoc(standRef, { slots: updatedSlots });
+                setShowAssignModal(false);
+            };
+
+            const handleReport = async (e) => {
+                e.preventDefault();
+                if (!user) return;
+                const standRef = doc(db, 'artifacts', appId, 'public', 'data', 'stands', selectedStand.id);
+                const newReports = { ...(selectedStand.reports || {}) };
+                
+                Object.keys(currentReportValues).forEach(cat => {
+                    newReports[cat] = (newReports[cat] || 0) + Number(currentReportValues[cat]);
+                });
+
+                const updatedSlots = selectedStand.slots.map(s => {
+                    if (s.id === selectedSlot.id && s.volunteer?.userId === user.uid) {
+                        const existing = s.reportedValues || {};
+                        const updated = { ...existing };
+                        Object.keys(currentReportValues).forEach(cat => {
+                            updated[cat] = (updated[cat] || 0) + Number(currentReportValues[cat]);
+                        });
+                        return { ...s, reportedValues: updated };
+                    }
+                    return s;
+                });
+
+                await updateDoc(standRef, { reports: newReports, slots: updatedSlots });
+                setShowReportModal(false);
+                setShowSuccessMsg(true);
+            };
+
+            const exportToExcel = () => {
+                let csv = "\uFEFFמיקום,סוג,קטגוריה,כמות\n";
+                stands.forEach(stand => {
+                    Object.entries(stand.reports || {}).forEach(([cat, val]) => {
+                        csv += `${stand.location},${stand.type},${cat},${val}\n`;
+                    });
+                });
+                
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.setAttribute("href", url);
+                link.setAttribute("download", `דוח_מבצעים_${new Date().toLocaleDateString()}.csv`);
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            if (authError) return (
+                <div className="min-h-screen flex flex-col items-center justify-center bg-red-50 text-red-900 p-6 text-center" dir="rtl">
+                    <i className="fas fa-exclamation-triangle text-5xl mb-4"></i>
+                    <h2 className="text-2xl font-bold mb-2">שגיאת הגדרה בפיירבייס</h2>
+                    <p className="max-w-md">{authError}</p>
+                    <div className="mt-6 bg-white p-4 rounded-xl shadow-sm text-sm text-right">
+                        <p className="font-bold mb-1">איך מתקנים?</p>
+                        <ol className="list-decimal list-inside space-y-1">
+                            <li>כנס ל-Firebase Console</li>
+                            <li>Authentication -> Sign-in method</li>
+                            <li>Add new provider -> Anonymous</li>
+                            <li>Enable -> Save</li>
+                        </ol>
                     </div>
-                    {newStandType === 'אחר' && (
-                      <input placeholder="פרט סוג פעילות..." required value={customStandType} onChange={e=>setCustomStandType(e.target.value)} className="w-full p-5 bg-slate-50 border-2 border-blue-500 rounded-2xl font-bold"/>
+                </div>
+            );
+
+            if (loading) return (
+                <div className="min-h-screen flex flex-col items-center justify-center bg-[#002B5B] text-white" dir="rtl">
+                    <HeartHandshake className="animate-pulse text-[#FFD700] text-6xl mb-4" />
+                    <h2 className="text-xl font-bold">מתחבר למבצעים...</h2>
+                </div>
+            );
+
+            return (
+                <div className="min-h-screen">
+                    <div className="bg-[#002B5B] text-white p-3 sticky top-0 z-40 shadow-xl border-b-4 border-[#FFD700]">
+                        <div className="max-w-5xl mx-auto flex items-center justify-between overflow-x-auto gap-8 no-scrollbar px-2">
+                            <div className="flex items-center gap-3 whitespace-nowrap bg-blue-900/40 p-2 px-4 rounded-xl border border-blue-700">
+                                <Trophy className="text-[#FFD700] text-xl" />
+                                <div className="text-sm font-black text-white leading-tight tracking-wide">
+                                    {stats.topVolunteer.name} <span className="text-[#FFD700] mr-1 text-xs">({stats.topVolunteer.total})</span>
+                                </div>
+                            </div>
+
+                            <div className="flex items-center gap-3 whitespace-nowrap bg-blue-900/40 p-2 px-4 rounded-xl border border-blue-700">
+                                <MapIcon className="text-[#FFD700]" />
+                                <div>
+                                    <div className="text-[10px] text-blue-200">דוכן מוביל</div>
+                                    <div className="text-sm font-bold text-white leading-tight">
+                                        {stats.topStand.location} <span className="text-[#FFD700]">({stats.topStand.count})</span>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="mr-auto flex items-center gap-4">
+                                {isAdmin && (
+                                    <button onClick={exportToExcel} className="p-2 bg-emerald-600 hover:bg-emerald-700 rounded-lg text-white transition-all shadow-md active:scale-90" title="ייצוא לאקסל">
+                                        <Download className="text-sm" />
+                                    </button>
+                                )}
+                                <button onClick={() => isAdmin ? setIsAdmin(false) : setShowAdminModal(true)} className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors">
+                                    {isAdmin ? <Unlock className="text-sm" /> : <Lock className="text-sm" />}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <header className="bg-[#002B5B] relative overflow-hidden text-white pt-12 pb-20 px-6 text-center">
+                        <div className="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
+                            <div className="absolute top-10 left-10 w-40 h-40 border-4 border-white rotate-12"></div>
+                            <div className="absolute bottom-10 right-10 w-60 h-60 border-[12px] border-[#FFD700] rounded-full"></div>
+                        </div>
+                        
+                        <div className="relative z-10 flex flex-col items-center">
+                            <img src="https://nayadotchabad.co.il/wp-content/uploads/2021/05/logo.png" alt="ניידות חב" className="h-16 mb-4 filter brightness-0 invert" onError={(e) => { e.target.style.display = 'none'; }} />
+                            <h1 className="text-4xl font-black mb-2 tracking-tighter">מרכז המבצעים</h1>
+                            <p className="bg-[#FFD700] text-[#002B5B] px-4 py-1 rounded-full text-sm font-black uppercase tracking-widest inline-block">מביאים את האור לכל מקום</p>
+                        </div>
+                    </header>
+
+                    <main className="max-w-4xl mx-auto px-4 -mt-12 space-y-6 relative z-20">
+                        <div className="bg-white rounded-[2.5rem] shadow-2xl p-8 border-b-8 border-[#FFD700] flex flex-col gap-6">
+                            <div className="flex flex-col md:flex-row justify-between items-center gap-4">
+                                <div className="flex items-center gap-3">
+                                    <div className="p-3 bg-blue-50 rounded-2xl text-blue-900"><TrendingUp className="text-2xl" /></div>
+                                    <h2 className="text-2xl font-black text-[#002B5B]">יעד המבצעים</h2>
+                                </div>
+                                <div className="text-center md:text-right">
+                                    <span className="block text-xs font-black text-slate-400 uppercase">הגענו ל-</span>
+                                    <span className="text-5xl font-black text-[#002B5B]">{stats.totalReached}</span>
+                                </div>
+                            </div>
+                            
+                            <div className="w-full mt-2 mb-2">
+                                <div className="flex justify-between text-xs font-black text-slate-400 mb-2 px-2">
+                                    <span>0</span>
+                                    <span>יעד: {CAMPAIGN_TARGET.toLocaleString()}</span>
+                                </div>
+                                <div className="h-8 bg-slate-100 rounded-full overflow-hidden shadow-inner relative">
+                                    <div className="h-full bg-gradient-to-r from-blue-500 to-[#002B5B] transition-all duration-1000 relative flex items-center justify-end px-4" style={{ width: `${Math.min((stats.totalReached / CAMPAIGN_TARGET) * 100, 100)}%` }}></div>
+                                </div>
+                            </div>
+
+                            <div className="flex flex-wrap gap-3 justify-center bg-slate-50 p-4 rounded-3xl border border-slate-100">
+                                <div className="bg-white px-5 py-2.5 rounded-2xl shadow-sm border border-slate-100 flex items-center gap-2">
+                                    <MapPin className="text-[#002B5B]" />
+                                    <span className="text-sm font-bold text-slate-600">מוקדים פעילים:</span>
+                                    <span className="text-base font-black text-[#002B5B]">{stats.activeStandsCount}</span>
+                                </div>
+                                {Object.entries(stats.categoryTotals).map(([cat, val]) => (
+                                    <div key={cat} className="bg-white px-5 py-2.5 rounded-2xl shadow-sm border border-slate-100 flex items-center gap-2">
+                                        <Star className="text-[#FFD700]" />
+                                        <span className="text-sm font-bold text-slate-600">{cat}:</span>
+                                        <span className="text-base font-black text-[#002B5B]">{val}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        {isAdmin && (
+                            <button onClick={() => setShowAddStand(true)} className="w-full bg-[#002B5B] text-white p-5 rounded-[2rem] font-black flex items-center justify-center gap-3 shadow-xl hover:scale-[1.02] transition-transform">
+                                <Plus className="text-[#FFD700] text-xl" /> הוספת מוקד חדש
+                            </button>
+                        )}
+
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            {stands.map(stand => (
+                                <div key={stand.id} className="bg-white rounded-[2rem] shadow-lg border-2 border-slate-100 overflow-hidden group flex flex-col">
+                                    <div className="p-6 flex-grow">
+                                        <div className="flex justify-between items-start mb-4">
+                                            <div className="bg-blue-50 text-[#002B5B] px-3 py-1 rounded-full text-[10px] font-black uppercase border border-blue-100">{stand.type}</div>
+                                            <MapPin className="text-[#FFD700] text-xl" />
+                                        </div>
+                                        <h3 className="text-2xl font-black text-[#002B5B] leading-tight mb-4">{stand.location}</h3>
+                                        
+                                        <div className="space-y-1 mb-6">
+                                            {Object.entries(stand.reports || {}).map(([cat, val]) => (
+                                                <div key={cat} className="flex justify-between items-center text-xs font-bold border-b border-slate-50 py-1">
+                                                    <span className="text-slate-400">{cat}:</span>
+                                                    <span className="text-[#002B5B] font-black">{val}</span>
+                                                </div>
+                                            ))}
+                                        </div>
+
+                                        <div className="space-y-3">
+                                            {stand.slots.map(slot => {
+                                                const isTaken = !!slot.volunteer;
+                                                const isMine = isTaken && slot.volunteer.userId === user?.uid;
+                                                return (
+                                                    <div key={slot.id} className="relative flex items-center gap-2">
+                                                        <button 
+                                                            disabled={isTaken && !isMine}
+                                                            onClick={() => {
+                                                                if (!isTaken) {
+                                                                    setSelectedStand(stand); setSelectedSlot(slot); setShowAssignModal(true);
+                                                                } else if (isMine) {
+                                                                    setSelectedStand(stand); setSelectedSlot(slot); setCurrentReportValues({}); setShowReportModal(true);
+                                                                }
+                                                            }}
+                                                            className={`flex-grow p-4 rounded-2xl border-2 text-right transition-all flex items-center justify-between ${
+                                                                isMine ? 'bg-[#FFD700]/10 border-[#FFD700] hover:bg-[#FFD700]/20' : 
+                                                                isTaken ? 'bg-slate-50 border-slate-100 opacity-60' : 
+                                                                'bg-white border-blue-50 hover:border-[#002B5B]'
+                                                            }`}
+                                                        >
+                                                            <div className="flex items-center gap-3">
+                                                                <Clock className={isTaken ? 'text-slate-300' : 'text-blue-300'} />
+                                                                <div className="text-right">
+                                                                    <div className="text-[10px] font-black text-slate-400">{slot.startTime}-{slot.endTime}</div>
+                                                                    <div className="text-xs font-black text-slate-800">{isTaken ? slot.volunteer.name : 'פנוי לשיבוץ'}</div>
+                                                                    {isMine && (
+                                                                        <div className="text-[10px] font-bold text-[#002B5B] mt-1 flex items-center gap-1">
+                                                                            <HeartHandshake /> לחץ לדיווח
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                            {isTaken && !isMine && <CheckCircle className="text-slate-200 text-xl" />}
+                                                            {!isTaken && <Plus className="text-[#FFD700] text-xl" />}
+                                                            {isMine && <ChevronRight className="text-[#002B5B] text-xl" />}
+                                                        </button>
+                                                        
+                                                        {isTaken && slot.volunteer.phone && (
+                                                            <a href={`tel:${slot.volunteer.phone}`} className="p-4 bg-blue-50 text-blue-600 rounded-2xl border border-blue-100"><Phone /></a>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                    {isAdmin && (
+                                        <div className="p-4 pt-0 border-t border-slate-50 text-center">
+                                            <button onClick={async () => await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'stands', stand.id))} className="mt-2 text-[10px] font-black uppercase tracking-widest text-slate-300 hover:text-red-500">ביטול מוקד זה</button>
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+
+                        <footer className="pt-16 pb-8 text-center">
+                            <p className="text-xl font-black text-[#002B5B] tracking-tight uppercase border-t border-slate-200 pt-8">
+                                יחי אדוננו מורנו ורבינו מלך המשיח לעולם ועד
+                            </p>
+                        </footer>
+                    </main>
+
+                    {/* Modals */}
+                    {(showAddStand || showAssignModal || showReportModal || showAdminModal || showSuccessMsg) && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 overflow-hidden">
+                            <div className="absolute inset-0 bg-[#002B5B]/80 backdrop-blur-sm" onClick={() => {
+                                setShowAddStand(false); setShowAssignModal(false); setShowReportModal(false); setShowAdminModal(false); setShowSuccessMsg(false);
+                            }}></div>
+                            <div className="bg-white w-full max-w-lg rounded-[2.5rem] shadow-2xl relative z-10 flex flex-col max-h-[90vh]">
+                                <div className="overflow-y-auto p-8 custom-scroll">
+                                    {showSuccessMsg && (
+                                        <div className="text-center py-4">
+                                            <div className="w-24 h-24 bg-emerald-50 rounded-full flex items-center justify-center mx-auto mb-6 border-4 border-emerald-100">
+                                                <CheckCircle className="text-emerald-500 text-5xl" />
+                                            </div>
+                                            <h2 className="text-3xl font-black text-[#002B5B] mb-4">תודה על העדכון!</h2>
+                                            <p className="text-xl font-bold text-slate-600 mb-8 leading-relaxed">הנתונים יישלחו בדו"ח<br/>לרבי מלך המשיח שליט"א</p>
+                                            <button onClick={() => setShowSuccessMsg(false)} className="w-full bg-[#002B5B] text-[#FFD700] p-5 rounded-3xl font-black text-xl shadow-xl active:scale-95 transition-all">המשך בעבודה</button>
+                                        </div>
+                                    )}
+                                    {showAddStand && (
+                                        <div className="space-y-6">
+                                            <h2 className="text-3xl font-black text-[#002B5B]">הקמת מוקד</h2>
+                                            <form onSubmit={handleAddStand} className="space-y-4">
+                                                <input placeholder="מיקום המוקד" required value={newStandLocation} onChange={e=>setNewStandLocation(e.target.value)} className="w-full p-5 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] outline-none font-bold"/>
+                                                <div className="grid grid-cols-3 gap-2">
+                                                    {['תפילין', 'נרות שבת', 'אחר'].map(t => (
+                                                        <button key={t} type="button" onClick={()=>setNewStandType(t)} className={`p-4 rounded-2xl text-xs font-black border-2 transition-all ${newStandType === t ? 'bg-[#002B5B] text-white border-[#002B5B]' : 'bg-white text-slate-400 border-slate-100'}`}>{t}</button>
+                                                    ))}
+                                                </div>
+                                                {newStandType === 'אחר' && (
+                                                    <input placeholder="פרט סוג פעילות..." required value={customStandType} onChange={e=>setCustomStandType(e.target.value)} className="w-full p-5 bg-slate-50 border-2 border-blue-500 rounded-2xl font-bold"/>
+                                                )}
+                                                <div className="flex gap-4">
+                                                    <div className="flex-1 text-center">
+                                                        <label className="text-[10px] font-black text-slate-400 block mb-1">התחלה</label>
+                                                        <input type="time" value={newStandStartTime} onChange={e=>setNewStandStartTime(e.target.value)} className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-transparent focus:border-[#002B5B]"/>
+                                                    </div>
+                                                    <div className="flex-1 text-center">
+                                                        <label className="text-[10px] font-black text-slate-400 block mb-1">סיום</label>
+                                                        <input type="time" value={newStandEndTime} onChange={e=>setNewStandEndTime(e.target.value)} className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-transparent focus:border-[#002B5B]"/>
+                                                    </div>
+                                                </div>
+                                                <input placeholder="מדדי דיווח (מופרדים בפסיק)" value={reportCategories.join(',')} onChange={e=>setReportCategories(e.target.value.split(','))} className="w-full p-4 bg-slate-50 rounded-2xl text-sm font-bold border-2 border-transparent focus:border-[#002B5B]"/>
+                                                <button className="w-full bg-[#002B5B] text-white p-6 rounded-3xl font-black text-xl shadow-xl active:scale-95 transition-all">הקם מוקד!</button>
+                                            </form>
+                                        </div>
+                                    )}
+                                    {showAssignModal && (
+                                        <div className="space-y-6">
+                                            <h2 className="text-3xl font-black text-[#002B5B] text-center">שיבוץ משימה</h2>
+                                            <p className="text-center font-black text-[#FFD700] bg-[#002B5B] py-2 px-4 rounded-full inline-block mx-auto w-fit text-sm">
+                                                {selectedSlot.startTime}-{selectedSlot.endTime} | {selectedStand.location}
+                                            </p>
+                                            <form onSubmit={handleAssign} className="space-y-4">
+                                                <input placeholder="שם מלא" required value={userNameInput} onChange={e=>setUserNameInput(e.target.value)} className="w-full p-6 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] font-black text-center text-xl shadow-inner"/>
+                                                <input placeholder="טלפון" required type="tel" value={userPhoneInput} onChange={e=>setUserPhoneInput(e.target.value)} className="w-full p-6 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] font-black text-center text-xl shadow-inner"/>
+                                                <button className="w-full bg-[#002B5B] text-white p-6 rounded-3xl font-black text-xl shadow-xl active:scale-95 transition-all">אני מגיע!</button>
+                                            </form>
+                                        </div>
+                                    )}
+                                    {showReportModal && (
+                                        <div className="space-y-8">
+                                            <div className="text-center">
+                                                <h2 className="text-3xl font-black text-[#002B5B]">דיווח מהשטח</h2>
+                                                <p className="text-slate-400 font-bold text-sm mt-1">{selectedStand.location}</p>
+                                                <div className="inline-block bg-[#FFD700]/20 text-[#002B5B] text-xs font-black px-3 py-1 rounded-full mt-2">
+                                                    עבור משמרת: {selectedSlot.startTime}-{selectedSlot.endTime}
+                                                </div>
+                                            </div>
+                                            <form onSubmit={handleReport} className="space-y-6">
+                                                {(selectedStand.categories || ['הנחות']).map(cat => (
+                                                    <div key={cat} className="space-y-2">
+                                                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">{cat.trim()}</label>
+                                                        <input type="number" placeholder="0" autoFocus onChange={e => setCurrentReportValues(v => ({...v, [cat.trim()]: e.target.value}))} className="w-full p-6 bg-slate-50 rounded-[2rem] border-4 border-slate-50 focus:border-[#FFD700] outline-none text-5xl font-black text-center text-[#002B5B]"/>
+                                                    </div>
+                                                ))}
+                                                <button className="w-full bg-[#002B5B] text-[#FFD700] p-6 rounded-3xl font-black text-2xl shadow-xl active:scale-95 transition-all">שלח נתונים</button>
+                                            </form>
+                                        </div>
+                                    )}
+                                    {showAdminModal && (
+                                        <div className="space-y-6">
+                                            <h2 className="text-3xl font-black text-[#002B5B] text-center uppercase tracking-tighter">ניהול המבצע</h2>
+                                            <form onSubmit={handleAdminLogin} className="space-y-4">
+                                                <input type="password" placeholder="סיסמה" autoFocus value={adminPassword} onChange={e=>setAdminPassword(e.target.value)} className="w-full p-6 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] font-black text-center text-2xl tracking-widest"/>
+                                                <button className="w-full bg-[#002B5B] text-white p-6 rounded-3xl font-black text-xl">כניסה</button>
+                                            </form>
+                                        </div>
+                                    )}
+                                    {!showSuccessMsg && (
+                                        <button onClick={() => {
+                                            setShowAddStand(false); setShowAssignModal(false); setShowReportModal(false); setShowAdminModal(false);
+                                        }} className="w-full mt-8 text-[10px] font-black text-slate-300 uppercase tracking-[0.2em] hover:text-red-500 transition-colors">סגירה</button>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
                     )}
-
-                    <div className="flex gap-4">
-                      <div className="flex-1 text-center">
-                        <label className="text-[10px] font-black text-slate-400 block mb-1">התחלה</label>
-                        <input type="time" value={newStandStartTime} onChange={e=>setNewStandStartTime(e.target.value)} className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-transparent focus:border-[#002B5B]"/>
-                      </div>
-                      <div className="flex-1 text-center">
-                        <label className="text-[10px] font-black text-slate-400 block mb-1">סיום</label>
-                        <input type="time" value={newStandEndTime} onChange={e=>setNewStandEndTime(e.target.value)} className="w-full p-4 bg-slate-50 rounded-2xl font-bold border-2 border-transparent focus:border-[#002B5B]"/>
-                      </div>
-                    </div>
                     
-                    <input placeholder="מדדי דיווח (הנחות, חומר הסברה...)" value={reportCategories.join(',')} onChange={e=>setReportCategories(e.target.value.split(','))} className="w-full p-4 bg-slate-50 rounded-2xl text-sm font-bold border-2 border-transparent focus:border-[#002B5B]"/>
-                    
-                    <button className="w-full bg-[#002B5B] text-white p-6 rounded-3xl font-black text-xl shadow-xl active:scale-95 transition-all">הקם מוקד!</button>
-                  </form>
+                    <style>{`
+                        .custom-scroll::-webkit-scrollbar { width: 8px; }
+                        .custom-scroll::-webkit-scrollbar-track { background: #f8fafc; border-radius: 10px; margin-top: 10px; margin-bottom: 10px; }
+                        .custom-scroll::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+                        .custom-scroll::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+                        input[type="time"]::-webkit-calendar-picker-indicator { filter: invert(0.2); }
+                    `}</style>
                 </div>
-              )}
+            );
+        }
 
-              {/* Assign */}
-              {showAssignModal && (
-                <div className="space-y-6">
-                  <h2 className="text-3xl font-black text-[#002B5B] text-center">שיבוץ משימה</h2>
-                  <p className="text-center font-black text-[#FFD700] bg-[#002B5B] py-2 px-4 rounded-full inline-block mx-auto w-fit text-sm">
-                    {selectedSlot.startTime}-{selectedSlot.endTime} | {selectedStand.location}
-                  </p>
-                  <form onSubmit={handleAssign} className="space-y-4">
-                    <input placeholder="שם מלא" required value={userNameInput} onChange={e=>setUserNameInput(e.target.value)} className="w-full p-6 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] font-black text-center text-xl shadow-inner"/>
-                    <input placeholder="טלפון" required type="tel" value={userPhoneInput} onChange={e=>setUserPhoneInput(e.target.value)} className="w-full p-6 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] font-black text-center text-xl shadow-inner"/>
-                    <button className="w-full bg-[#002B5B] text-white p-6 rounded-3xl font-black text-xl shadow-xl active:scale-95 transition-all">אני מגיע!</button>
-                  </form>
-                </div>
-              )}
+        const initReactApp = () => {
+            const container = document.getElementById('root');
+            if (container) {
+                const root = ReactDOM.createRoot(container);
+                root.render(<App firebaseModules={window.firebaseModules} />);
+            }
+        };
 
-              {/* Report Form */}
-              {showReportModal && (
-                <div className="space-y-8">
-                  <div className="text-center">
-                    <h2 className="text-3xl font-black text-[#002B5B]">דיווח מהשטח</h2>
-                    <p className="text-slate-400 font-bold text-sm mt-1">{selectedStand.location}</p>
-                    <div className="inline-block bg-[#FFD700]/20 text-[#002B5B] text-xs font-black px-3 py-1 rounded-full mt-2">
-                      עבור משמרת: {selectedSlot.startTime}-{selectedSlot.endTime}
-                    </div>
-                  </div>
-                  <form onSubmit={handleReport} className="space-y-6">
-                    {(selectedStand.categories || ['הנחות']).map(cat => (
-                      <div key={cat} className="space-y-2">
-                        <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">{cat.trim()}</label>
-                        <input 
-                          type="number" 
-                          placeholder="0" 
-                          autoFocus
-                          onChange={e => setCurrentReportValues(v => ({...v, [cat]: e.target.value}))}
-                          className="w-full p-6 bg-slate-50 rounded-[2rem] border-4 border-slate-50 focus:border-[#FFD700] outline-none text-5xl font-black text-center text-[#002B5B]"
-                        />
-                      </div>
-                    ))}
-                    <button className="w-full bg-[#002B5B] text-[#FFD700] p-6 rounded-3xl font-black text-2xl shadow-xl active:scale-95 transition-all">שלח נתונים</button>
-                  </form>
-                </div>
-              )}
-
-              {/* Admin Login */}
-              {showAdminModal && (
-                <div className="space-y-6">
-                  <h2 className="text-3xl font-black text-[#002B5B] text-center uppercase tracking-tighter">ניהול המבצע</h2>
-                  <form onSubmit={handleAdminLogin} className="space-y-4">
-                    <input type="password" placeholder="סיסמה" autoFocus value={adminPassword} onChange={e=>setAdminPassword(e.target.value)} className="w-full p-6 bg-slate-50 rounded-2xl border-2 border-transparent focus:border-[#002B5B] font-black text-center text-2xl tracking-widest"/>
-                    <button className="w-full bg-[#002B5B] text-white p-6 rounded-3xl font-black text-xl">כניסה</button>
-                  </form>
-                </div>
-              )}
-
-              {/* Close Button (Hidden on Success Msg to force user to read it) */}
-              {!showSuccessMsg && (
-                <button onClick={() => {
-                  setShowAddStand(false); setShowAssignModal(false); setShowReportModal(false); setShowAdminModal(false);
-                }} className="w-full mt-8 text-[10px] font-black text-slate-300 uppercase tracking-[0.2em] hover:text-red-500 transition-colors">סגירה</button>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-      
-      {/* Custom Scrollbar CSS */}
-      <style>{`
-        .custom-scroll::-webkit-scrollbar { 
-          width: 8px; 
+        if (window.firebaseModules) {
+            initReactApp();
+        } else {
+            window.addEventListener('firebase-modules-loaded', initReactApp);
         }
-        .custom-scroll::-webkit-scrollbar-track { 
-          background: #f8fafc; 
-          border-radius: 10px;
-          margin-top: 10px;
-          margin-bottom: 10px;
-        }
-        .custom-scroll::-webkit-scrollbar-thumb { 
-          background: #cbd5e1; 
-          border-radius: 10px; 
-        }
-        .custom-scroll::-webkit-scrollbar-thumb:hover { 
-          background: #94a3b8; 
-        }
-        input[type="time"]::-webkit-calendar-picker-indicator { 
-          filter: invert(0.2); 
-        }
-      `}</style>
-    </div>
-  );
-}
+    </script>
+</body>
+</html>
